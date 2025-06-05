@@ -12,6 +12,12 @@ class TextEditorClient:
         self.root = root
         self.root.title("Metin Editörü")
         self.client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.active_editors = {}  # filename -> [usernames]
+        self.edit_windows = {}  # filename -> window
+        self.text_widgets = {}  # filename -> text_widget
+        self.last_cursor_positions = {}  # filename -> cursor_position
+        self.is_updating = False  # Güncelleme sırasında yeni güncelleme göndermeyi engellemek için
+        self.username = None  # Kullanıcı adını saklamak için
         
         self.setup_ui()
         self.connect_to_server()
@@ -38,22 +44,76 @@ class TextEditorClient:
     
     def connect_to_server(self):
         try:
-            username = simpledialog.askstring("Kullanıcı Adı", "Kullanıcı adınızı girin:")
-            if not username:
+            self.username = simpledialog.askstring("Kullanıcı Adı", "Kullanıcı adınızı girin:")
+            if not self.username:
                 self.root.destroy()
                 return
                 
             self.client_socket.connect((HOST, PORT))
-            self.client_socket.send(create_message("HELLO", username).encode())
+            self.client_socket.send(create_message("HELLO", self.username).encode())
             
             # Sunucu dinleme thread'i
             threading.Thread(target=self.listen_server, daemon=True).start()
-            self.status_bar.config(text=f"Bağlantı kuruldu - Kullanıcı: {username}")
+            self.status_bar.config(text=f"Bağlantı kuruldu - Kullanıcı: {self.username}")
             
         except Exception as e:
             messagebox.showerror("Hata", f"Sunucuya bağlanılamadı: {str(e)}")
             self.root.destroy()
     
+    def on_text_change(self, event, filename):
+        if self.is_updating:
+            return
+            
+        text_widget = event.widget
+        new_text = text_widget.get(1.0, tk.END)
+        cursor_pos = text_widget.index(tk.INSERT)
+        self.last_cursor_positions[filename] = cursor_pos
+        print(f"Metin değişikliği gönderiliyor: {filename} - İmleç: {cursor_pos}")
+        self.client_socket.send(create_message("EDIT", f"{filename}||{new_text}").encode())
+
+    def get_text_widget(self, filename):
+        """Belirli bir dosya için text widget'ı döndürür"""
+        if filename in self.text_widgets:
+            return self.text_widgets[filename]
+        return None
+
+    def update_text_content(self, text_widget, new_text, filename):
+        if self.is_updating:
+            return
+            
+        self.is_updating = True
+        try:
+            print(f"Metin güncelleniyor: {filename}")
+            # Mevcut imleç pozisyonunu kaydet
+            cursor_pos = text_widget.index(tk.INSERT)
+            print(f"Mevcut imleç pozisyonu: {cursor_pos}")
+            
+            # Metni güncelle
+            text_widget.delete(1.0, tk.END)
+            text_widget.insert(tk.END, new_text)
+            
+            # İmleç pozisyonunu geri yükle
+            if filename in self.last_cursor_positions:
+                saved_pos = self.last_cursor_positions[filename]
+                print(f"Kaydedilmiş imleç pozisyonu: {saved_pos}")
+                text_widget.mark_set(tk.INSERT, saved_pos)
+                text_widget.see(saved_pos)
+            else:
+                print(f"Kaydedilmiş imleç pozisyonu bulunamadı, mevcut pozisyon kullanılıyor: {cursor_pos}")
+                text_widget.mark_set(tk.INSERT, cursor_pos)
+                text_widget.see(cursor_pos)
+        finally:
+            self.is_updating = False
+
+    def update_active_editors_display(self, filename):
+        if filename in self.edit_windows:
+            window = self.edit_windows[filename]
+            editors = self.active_editors.get(filename, [])
+            if editors:
+                window.title(f"Düzenle: {filename} (Aktif düzenleyiciler: {', '.join(editors)})")
+            else:
+                window.title(f"Düzenle: {filename}")
+
     def listen_server(self):
         while True:
             try:
@@ -62,43 +122,36 @@ class TextEditorClient:
                     break
                     
                 msg_type, content = parse_message(msg)
+                print(f"Sunucudan gelen mesaj: {msg_type} - {content[:50]}...")
                 
                 if msg_type == "UPDATE":
                     filename, new_text = content.split("||", 1)
-                    self.display_content(filename, new_text)
+                    print(f"Güncelleme alındı: {filename}")
+                    text_widget = self.get_text_widget(filename)
+                    if text_widget:
+                        print(f"Deneme 1: Metin güncelleniyor: {filename}")
+                        self.update_text_content(text_widget, new_text, filename)
+                        print(f"Deneme 2: Metin güncellendi: {filename}")
                 elif msg_type == "FILES":
                     self.show_file_list(content)
                 elif msg_type == "INFO":
                     messagebox.showinfo("Bilgi", content)
                 elif msg_type == "CONTENT":
                     filename, file_content = content.split("||", 1)
-                    print(f"Gelen dosya: {filename}")
-                    
-                    def find_text_widget(widget):
-                        if isinstance(widget, tk.Text):
-                            return widget
-                        for child in widget.winfo_children():
-                            result = find_text_widget(child)
-                            if result:
-                                return result
-                        return None
-
-                    for window in self.root.winfo_children():
-                        if isinstance(window, tk.Toplevel) and (filename in window.title() or filename == window.title()):
-                            print(f"Eşleşen pencere bulundu: {window.title()}")
-                            text_widget = find_text_widget(window)
-                            if text_widget:
-                                text_widget.delete(1.0, tk.END)
-                                text_widget.insert(tk.END, file_content)
-                                text_widget.update_idletasks()
-                            else:
-                                print("Text widget bulunamadı!")
-                            break
+                    print(f"Dosya içeriği alındı: {filename}")
+                    text_widget = self.get_text_widget(filename)
+                    if text_widget:
+                        print(f"İlk içerik yükleniyor: {filename}")
+                        self.update_text_content(text_widget, file_content, filename)
+                        print(f"İlk içerik yüklendi: {filename}")
+                elif msg_type == "ACTIVE_EDITORS":
+                    filename, editors = content.split("||", 1)
+                    if editors:
+                        self.active_editors[filename] = editors.split(",")
                     else:
-                        print(f"Açık pencere bulunamadı. Ana alana yazılıyor: {filename}")
-                        self.display_content(filename, file_content)
-
-
+                        self.active_editors[filename] = []
+                    print(f"Aktif düzenleyiciler güncellendi: {filename} - {self.active_editors[filename]}")
+                    self.update_active_editors_display(filename)
                     
             except Exception as e:
                 print(f"Sunucu dinleme hatası: {str(e)}")
@@ -126,23 +179,40 @@ class TextEditorClient:
             if not filename:
                 return
                 
+        if filename in self.edit_windows:
+            self.edit_windows[filename].lift()
+            return
+
         edit_window = tk.Toplevel(self.root)
         edit_window.title(f"Düzenle: {filename}")
+        self.edit_windows[filename] = edit_window
         
+        # Text widget'ı oluştur ve referansını sakla
         text_area = scrolledtext.ScrolledText(edit_window, wrap=tk.WORD)
         text_area.pack(expand=True, fill='both')
+        self.text_widgets[filename] = text_area
+        
+        # Metin değişikliği olayını dinle
+        text_area.bind('<KeyRelease>', lambda e: self.on_text_change(e, filename))
         
         # Sunucudan dosya içeriğini iste
+        print(f"Dosya içeriği isteniyor: {filename}")
         self.client_socket.send(create_message("GET", filename).encode())
         
-        def save_changes():
-            new_text = text_area.get(1.0, tk.END).strip()
-            self.client_socket.send(create_message("EDIT", f"{filename}||{new_text}").encode())
+        def on_window_close():
+            print(f"Dosya düzenleme kapatılıyor: {filename}")
+            self.client_socket.send(create_message("CLOSE_EDIT", filename).encode())
+            if filename in self.edit_windows:
+                del self.edit_windows[filename]
+            if filename in self.text_widgets:
+                del self.text_widgets[filename]
+            if filename in self.active_editors:
+                del self.active_editors[filename]
+            if filename in self.last_cursor_positions:
+                del self.last_cursor_positions[filename]
             edit_window.destroy()
-            messagebox.showinfo("Başarılı", "Değişiklikler kaydedildi!")
         
-        save_button = tk.Button(edit_window, text="Kaydet", command=save_changes)
-        save_button.pack()
+        edit_window.protocol("WM_DELETE_WINDOW", on_window_close)
     
     def exit_app(self):
         self.client_socket.close()
